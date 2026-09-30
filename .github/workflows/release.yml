@@ -1,0 +1,81 @@
+# Publishes lk.payments:payments-lk-android to Maven Central when a version tag is pushed, signed,
+# through the Central Portal. The secrets:
+#   MAVEN_CENTRAL_USERNAME, MAVEN_CENTRAL_PASSWORD   a Central Portal user token
+#   SIGNING_KEY, SIGNING_KEY_PASSWORD                the release signing key, ASCII armoured, and its passphrase
+# Central checks the signature against the key's public half on a public key
+# server before it accepts a version.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: maven-central
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Check the tag names the library's version
+        run: |
+          VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' payments-lk/build.gradle.kts)"
+          if [ "v$VERSION" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::The tag is $GITHUB_REF_NAME but payments-lk/build.gradle.kts says $VERSION."
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Test
+        run: ./gradlew :payments-lk:testDebugUnitTest --no-daemon
+
+      # Safe to run again once Central has the version (it can take half an hour to appear).
+      - name: Publish to Maven Central
+        run: |
+          if curl -sfI "https://repo1.maven.org/maven2/lk/payments/payments-lk-android/$VERSION/payments-lk-android-$VERSION.pom" > /dev/null; then
+            echo "$VERSION is already on Maven Central."
+            exit 0
+          fi
+          for v in ORG_GRADLE_PROJECT_mavenCentralUsername ORG_GRADLE_PROJECT_mavenCentralPassword ORG_GRADLE_PROJECT_signingInMemoryKey ORG_GRADLE_PROJECT_signingInMemoryKeyPassword; do
+            if [ -z "${!v}" ]; then
+              echo "::error::A secret this needs is not set ($v)."
+              exit 1
+            fi
+          done
+          ./gradlew :payments-lk:publishAndReleaseToMavenCentral --no-daemon --no-configuration-cache
+        env:
+          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.SIGNING_KEY }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.SIGNING_KEY_PASSWORD }}
+
+      - name: GitHub release
+        run: |
+          awk -v v="$VERSION" 'index($0, "## " v " ") == 1 { on = 1; next } on && /^## / { exit } on { print }' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          if [ ! -s "$RUNNER_TEMP/notes.md" ]; then
+            echo "::error::CHANGELOG.md has no section for $VERSION."
+            exit 1
+          fi
+          printf '\nGradle: `implementation("lk.payments:payments-lk-android:%s")`\n' "$VERSION" >> "$RUNNER_TEMP/notes.md"
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            echo "The release for $GITHUB_REF_NAME exists."
+          else
+            gh release create "$GITHUB_REF_NAME" --verify-tag --title "Android $VERSION" --notes-file "$RUNNER_TEMP/notes.md"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
